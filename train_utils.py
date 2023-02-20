@@ -10,7 +10,7 @@ import os
 from copy import deepcopy
 from torch.optim.optimizer import Optimizer, required
 import copy
-from custom_writer import CustomWriter
+from TorchSSL.custom_writer import CustomWriter
 
 '''
 We reimplement SGD to keep cosistent with the origin paper. But we actually do not use it. You can use it if you want.

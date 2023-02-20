@@ -3,7 +3,7 @@ import math
 import torch.nn.functional as F
 import numpy as np
 
-from train_utils import ce_loss
+from TorchSSL.train_utils import ce_loss
 
 
 class Get_Scalar:

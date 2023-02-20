@@ -3,17 +3,18 @@ import json
 import torch
 import numpy as np
 import pandas as pd
-import torch.nn as nn
+import glob
 import torch.nn.functional as F
 import torchvision.models as models
 from torch.cuda.amp import autocast, GradScaler
 from collections import Counter
 import os
+from TorchSSL.GAT_utils import accuracy
 import contextlib
-from train_utils import AverageMeter
+from TorchSSL.train_utils import AverageMeter
 
 from .flexmatch_utils import consistency_loss, Get_Scalar
-from train_utils import ce_loss, wd_loss, EMA, Bn_Controller
+from TorchSSL.train_utils import ce_loss, wd_loss, EMA, Bn_Controller
 
 from sklearn.metrics import *
 from copy import deepcopy
@@ -49,7 +50,7 @@ class FlexMatch:
         # network is builded only by num_classes,
         # other configs are covered in main.py
 
-        self.model = net_builder(num_classes=num_classes)
+        self.model = net_builder
         self.ema_model = None
 
         self.num_eval_iter = num_eval_iter
@@ -68,83 +69,52 @@ class FlexMatch:
 
         self.bn_controller = Bn_Controller()
 
-    def set_data_loader(self, loader_dict):
-        self.loader_dict = loader_dict
-        self.print_fn(f'[!] data loader keys: {self.loader_dict.keys()}')
-
-    def set_dset(self, dset):
-        self.ulb_dset = dset
+    def set_data_loader(self, idx_train, idx_val, idx_test, idx_train_unlb, features, unlb_features, adj, labels):
+        self.idx_train = idx_train.cuda()
+        self.idx_val = idx_val.cuda()
+        self.idx_test = idx_test.cuda()
+        self.idx_train_unlb = idx_train_unlb.cuda()
+        self.features = features.cuda()
+        self.unlb_features = unlb_features.cuda()
+        self.adj = adj.cuda()
+        self.labels = labels.cuda()
 
     def set_optimizer(self, optimizer, scheduler=None):
         self.optimizer = optimizer
         self.scheduler = scheduler
 
-    def train(self, args, logger=None):
-
-        ngpus_per_node = torch.cuda.device_count()
+    def model_train(self, args, logger=None):
 
         # EMA Init
         self.model.train()
         self.ema = EMA(self.model, self.ema_m)
         self.ema.register()
-        if args.resume == True:
+        if args.resume:
             self.ema.load(self.ema_model)
 
         # p(y) based on the labeled examples seen during training
-        dist_file_name = r"./data_statistics/" + args.dataset + '_' + str(args.num_labels) + '.json'
-        if args.dataset.upper() == 'IMAGENET':
-            p_target = None
-        else:
-            with open(dist_file_name, 'r') as f:
-                p_target = json.loads(f.read())
-                p_target = torch.tensor(p_target['distribution'])
-                p_target = p_target.cuda(args.gpu)
-            # print('p_target:', p_target)
-
+        p_target = None
         p_model = None
 
-        # for gpu profiling
-        start_batch = torch.cuda.Event(enable_timing=True)
-        end_batch = torch.cuda.Event(enable_timing=True)
-        start_run = torch.cuda.Event(enable_timing=True)
-        end_run = torch.cuda.Event(enable_timing=True)
-
-        start_batch.record()
-        best_eval_acc, best_it = 0.0, 0
-
-        scaler = GradScaler()
-        amp_cm = autocast if args.amp else contextlib.nullcontext
-
-        # eval for once to verify if the checkpoint is loaded correctly
-        if args.resume == True:
+        if args.resume:
             eval_dict = self.evaluate(args=args)
             print(eval_dict)
 
-        selected_label = torch.ones((len(self.ulb_dset),), dtype=torch.long, ) * -1
-        selected_label = selected_label.cuda(args.gpu)
+        selected_label = torch.ones((len(self.idx_train_unlb),), dtype=torch.long, ) * -1
+        selected_label = selected_label.cuda()
 
-        classwise_acc = torch.zeros((args.num_classes,)).cuda(args.gpu)
+        classwise_acc = torch.zeros((2,)).cuda()
 
-        for (_, x_lb, y_lb), (x_ulb_idx, x_ulb_w, x_ulb_s) in zip(self.loader_dict['train_lb'],
-                                                                  self.loader_dict['train_ulb']):
-            # prevent the training iterations exceed args.num_train_iter
-            if self.it > args.num_train_iter:
-                break
-
-            end_batch.record()
-            torch.cuda.synchronize()
-            start_run.record()
-
-            num_lb = x_lb.shape[0]
-            num_ulb = x_ulb_w.shape[0]
-            assert num_ulb == x_ulb_s.shape[0]
-
-            x_lb, x_ulb_w, x_ulb_s = x_lb.cuda(args.gpu), x_ulb_w.cuda(args.gpu), x_ulb_s.cuda(args.gpu)
-            x_ulb_idx = x_ulb_idx.cuda(args.gpu)
-            y_lb = y_lb.cuda(args.gpu)
-
+        loss_values = []
+        bad_counter = 0
+        best = args.epochs + 1
+        best_epoch = 0
+        x_ulb_idx = torch.LongTensor(range(500)).cuda()
+        for epoch in range(args.epochs):
+            self.model.train()
+            self.optimizer.zero_grad()
             pseudo_counter = Counter(selected_label.tolist())
-            if max(pseudo_counter.values()) < len(self.ulb_dset):  # not all(5w) -1
+            if max(pseudo_counter.values()) < len(self.idx_train_unlb):  # not all(5w) -1
                 if args.thresh_warmup:
                     for i in range(args.num_classes):
                         classwise_acc[i] = pseudo_counter[i] / max(pseudo_counter.values())
@@ -155,97 +125,89 @@ class FlexMatch:
                     for i in range(args.num_classes):
                         classwise_acc[i] = pseudo_counter[i] / max(wo_negative_one.values())
 
-            inputs = torch.cat((x_lb, x_ulb_w, x_ulb_s))
+            output = self.model(self.features, self.adj)
+            output_ul = self.model(self.unlb_features, self.adj)
+            sup_loss = ce_loss(output[self.idx_train], self.labels[self.idx_train], reduction='mean')
+            # loss_train = F.nll_loss(output[idx_train], labels[idx_train])
+            # hyper-params for update
+            T = self.t_fn(self.it)
+            p_cutoff = self.p_fn(self.it)
 
-            # inference and calculate sup/unsup losses
-            with amp_cm():
-                logits = self.model(inputs)
-                logits_x_lb = logits[:num_lb]
-                logits_x_ulb_w, logits_x_ulb_s = logits[num_lb:].chunk(2)
-                sup_loss = ce_loss(logits_x_lb, y_lb, reduction='mean')
+            unsup_loss, mask, select, pseudo_lb, p_model = consistency_loss(output_ul[self.idx_train_unlb],
+                                                                            output[self.idx_train_unlb],
+                                                                            classwise_acc,
+                                                                            p_target,
+                                                                            p_model,
+                                                                            'ce', T, p_cutoff,
+                                                                            use_hard_labels=args.hard_label,
+                                                                            use_DA=args.use_DA)
 
-                # hyper-params for update
-                T = self.t_fn(self.it)
-                p_cutoff = self.p_fn(self.it)
+            if x_ulb_idx[select == 1].nelement() != 0:
+                selected_label[x_ulb_idx[select == 1]] = pseudo_lb[select == 1]
 
-                unsup_loss, mask, select, pseudo_lb, p_model = consistency_loss(logits_x_ulb_s,
-                                                                                logits_x_ulb_w,
-                                                                                classwise_acc,
-                                                                                p_target,
-                                                                                p_model,
-                                                                                'ce', T, p_cutoff,
-                                                                                use_hard_labels=args.hard_label,
-                                                                                use_DA=args.use_DA)
-
-                if x_ulb_idx[select == 1].nelement() != 0:
-                    selected_label[x_ulb_idx[select == 1]] = pseudo_lb[select == 1]
-
-                total_loss = sup_loss + self.lambda_u * unsup_loss
+            total_loss = sup_loss + self.lambda_u * unsup_loss
 
             # parameter updates
-            if args.amp:
-                scaler.scale(total_loss).backward()
-                if (args.clip > 0):
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), args.clip)
-                scaler.step(self.optimizer)
-                scaler.update()
-            else:
-                total_loss.backward()
-                if (args.clip > 0):
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), args.clip)
-                self.optimizer.step()
-
-            self.scheduler.step()
+            total_loss.backward()
+            self.optimizer.step()
             self.ema.update()
-            self.model.zero_grad()
 
-            end_run.record()
-            torch.cuda.synchronize()
+            if not args.fastmode:
+                # Evaluate validation set performance separately,
+                # deactivates dropout during validation run.
+                self.model.eval()
+                self.ema.apply_shadow()
+                output = self.model(self.features, self.adj)
 
-            # tensorboard_dict update
-            tb_dict = {}
-            tb_dict['train/sup_loss'] = sup_loss.detach()
-            tb_dict['train/unsup_loss'] = unsup_loss.detach()
-            tb_dict['train/total_loss'] = total_loss.detach()
-            tb_dict['train/mask_ratio'] = 1.0 - mask.detach()
-            tb_dict['lr'] = self.optimizer.param_groups[0]['lr']
-            tb_dict['train/prefecth_time'] = start_batch.elapsed_time(end_batch) / 1000.
-            tb_dict['train/run_time'] = start_run.elapsed_time(end_run) / 1000.
+            loss_val = F.nll_loss(output[self.idx_val], self.labels[self.idx_val])
+            acc_val, recall_val, auc_val = accuracy(output[self.idx_val], self.labels[self.idx_val])
+            self.ema.restore()
+            print('Epoch: {:04d}'.format(epoch + 1),
+                  'loss_train: {:.4f}'.format(total_loss.data.item()),
+                  'loss_val: {:.4f}'.format(loss_val.data.item()),
+                  'acc_val: {:.4f}'.format(acc_val.data.item()),
+                  'recall_val: {:.4f}'.format(recall_val),
+                  'auc_val: {:.4f}'.format(auc_val))
 
-            # Save model for each 10K steps and best model for each 1K steps
-            if self.it % 10000 == 0:
-                save_path = os.path.join(args.save_dir, args.save_name)
-                if not args.multiprocessing_distributed or \
-                        (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
-                    self.save_model('latest_model.pth', save_path)
+            loss_values.append(loss_val.data.item())
 
-            if self.it % self.num_eval_iter == 0:
-                eval_dict = self.evaluate(args=args)
-                tb_dict.update(eval_dict)
-                save_path = os.path.join(args.save_dir, args.save_name)
-                if tb_dict['eval/top-1-acc'] > best_eval_acc:
-                    best_eval_acc = tb_dict['eval/top-1-acc']
-                    best_it = self.it
-                self.print_fn(
-                    f"{self.it} iteration, USE_EMA: {self.ema_m != 0}, {tb_dict}, BEST_EVAL_ACC: {best_eval_acc}, at {best_it} iters")
+            torch.save(self.model.state_dict(), '{}.pkl'.format(epoch))
+            if loss_values[-1] < best:
+                best = loss_values[-1]
+                best_epoch = epoch
+                bad_counter = 0
+            else:
+                bad_counter += 1
 
-                if not args.multiprocessing_distributed or \
-                        (args.multiprocessing_distributed and args.rank % ngpus_per_node == 0):
+            if bad_counter == args.patience:
+                break
 
-                    if self.it == best_it:
-                        self.save_model('model_best.pth', save_path)
-                    if not self.tb_log is None:
-                        self.tb_log.update(tb_dict, self.it)
+            files = glob.glob('*.pkl')
+            for file in files:
+                epoch_nb = int(file.split('.')[0])
+                if epoch_nb < best_epoch:
+                    os.remove(file)
 
-            self.it += 1
-            del tb_dict
-            start_batch.record()
-            if self.it > 0.8 * args.num_train_iter:
-                self.num_eval_iter = 1000
+        files = glob.glob('*.pkl')
+        for file in files:
+            epoch_nb = int(file.split('.')[0])
+            if epoch_nb > best_epoch:
+                os.remove(file)
 
-        eval_dict = self.evaluate(args=args)
-        eval_dict.update({'eval/best_acc': best_eval_acc, 'eval/best_it': best_it})
-        return eval_dict
+        print("Optimization Finished!")
+        print('Loading {}th epoch'.format(best_epoch))
+        self.model.load_state_dict(torch.load('{}.pkl'.format(best_epoch)))
+
+        # Testing
+        self.model.eval()
+        output = self.model(self.features, self.adj)
+        loss_test = F.nll_loss(output[self.idx_test], self.labels[self.idx_test])
+        acc_test, recall_test, auc_test = accuracy(output[self.idx_test], self.labels[self.idx_test])
+        print("Test set results:",
+              "loss= {:.4f}".format(loss_test.data.item()),
+              "accuracy= {:.4f}".format(acc_test.data.item()),
+              "recall= {:.4f}".format(recall_test),
+              "auc= {:.4f}".format(auc_test))
 
     @torch.no_grad()
     def evaluate(self, eval_loader=None, args=None):
@@ -327,7 +289,6 @@ class FlexMatch:
         for i in range(1, nu + 1):
             xy[0][i], xy[i][i] = xy[i][i], xy[0][i]
         return [torch.cat(v, dim=0) for v in xy]
-
 
 if __name__ == "__main__":
     pass

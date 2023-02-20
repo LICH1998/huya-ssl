@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from train_utils import ce_loss
+from TorchSSL.train_utils import ce_loss
 
 
 class Get_Scalar:
@@ -14,7 +14,7 @@ class Get_Scalar:
         return self.value
 
 
-def consistency_loss(logits_s, logits_w, name='ce', T=1.0, p_cutoff=0.0, use_hard_labels=True):
+def consistency_loss(logits_s, logits_w, name='ce', T =1.0, p_cutoff=0.0, use_hard_labels=True):
     assert name in ['ce', 'L2']
     logits_w = logits_w.detach()
     if name == 'L2':

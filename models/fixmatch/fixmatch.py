@@ -10,11 +10,10 @@ from torch.cuda.amp import autocast, GradScaler
 from collections import Counter
 import os
 import contextlib
-from train_utils import AverageMeter
+from TorchSSL.train_utils import AverageMeter
 
-from .fixmatch_utils import consistency_loss, Get_Scalar
-from train_utils import ce_loss, wd_loss, EMA, Bn_Controller
-
+from TorchSSL.models.fixmatch.fixmatch_utils import consistency_loss, Get_Scalar
+from TorchSSL.train_utils import ce_loss, wd_loss, EMA, Bn_Controller
 from sklearn.metrics import *
 from copy import deepcopy
 
@@ -121,7 +120,7 @@ class FixMatch:
             # prevent the training iterations exceed args.num_train_iter
             if self.it > args.num_train_iter:
                 break
-
+            # 用torch.cuda.Event() 精确记录GPU的运行时间：
             end_batch.record()
             torch.cuda.synchronize()
             start_run.record()
